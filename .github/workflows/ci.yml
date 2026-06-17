@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - master
+      - dev
   pull_request:
 
 permissions:
@@ -32,3 +34,9 @@ jobs:
 
       - name: Test
         run: ./gradlew test
+
+      - name: Build Spring Boot jar
+        run: ./gradlew bootJar
+
+      - name: Build Docker image
+        run: docker build -t dori-community-be:${{ github.sha }} .
