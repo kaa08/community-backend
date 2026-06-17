@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: dori-community
+
+  cache:
+    type: simple
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        format_sql: true
+        show_sql: true
+    database-platform: org.hibernate.dialect.MySQL8Dialect
+
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+jwt:
+  header: Authorization
+  prefix: "Bearer "
+  secret: ${JWT_SECRET}
+  token-expiration-time: ${JWT_TOKEN_EXPIRATION_TIME:3600}
+  refresh-expiration-time: ${JWT_REFRESH_EXPIRATION_TIME:1209600}
+
+aws:
+  credentials:
+    access-key: ${AWS_ACCESS_KEY}
+    secret-key: ${AWS_SECRET_KEY}
+  s3:
+    bucket: ${AWS_S3_BUCKET}
+  region: ${AWS_REGION:ap-northeast-2}
+
+logging:
+  level:
+    org.springframework.cache: TRACE
+    org.springframework.jdbc.core.JdbcTemplate: DEBUG
+    org.springframework.jdbc.core.StatementCreatorUtils: TRACE

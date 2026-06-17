@@ -36,9 +36,10 @@ out/
 ### VS Code ###
 .vscode/
 
-
-# Ignore Spring Boot configuration files
-application.yml
-application.yaml
-src/main/resources/application.yml
-src/main/resources/application.yaml
+# Local environment variables and private Spring profiles
+.env
+.env.*
+!.env.example
+spy.log
+src/main/resources/application-local.yml
+src/main/resources/application-local.yaml
