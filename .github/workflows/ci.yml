@@ -1,10 +1,16 @@
 name: CI
 
 on:
+  pull_request:
+    branches:
+      - main
+      - master
+      - dev
   push:
     branches:
       - main
-  pull_request:
+      - master
+      - dev
 
 permissions:
   contents: read
@@ -32,3 +38,9 @@ jobs:
 
       - name: Test
         run: ./gradlew test
+
+      - name: Build Spring Boot jar
+        run: ./gradlew bootJar
+
+      - name: Build Docker image
+        run: docker build -t dori-community-be:${{ github.sha }} .
