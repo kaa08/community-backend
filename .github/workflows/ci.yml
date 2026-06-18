@@ -1,12 +1,16 @@
 name: CI
 
 on:
+  pull_request:
+    branches:
+      - main
+      - master
+      - dev
   push:
     branches:
       - main
       - master
       - dev
-  pull_request:
 
 permissions:
   contents: read
