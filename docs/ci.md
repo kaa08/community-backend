@@ -28,7 +28,7 @@ CI 성공 != 서버 배포 완료
 CI workflow 파일은 다음 위치에 있다.
 
 ```text
-.github/workflows/ci.yml
+.github/workflows/ci-cd.yml
 ```
 
 현재 CI는 `main`, `master`, `dev` 브랜치 push와 pull request에서 실행되도록 설정했다.
