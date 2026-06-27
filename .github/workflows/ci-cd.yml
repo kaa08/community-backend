@@ -91,4 +91,18 @@ jobs:
               --env-file ~/dori/.env \
               -p 8080:8080 \
               "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-            docker image prune -f
+
+            for i in $(seq 1 30); do
+              if curl -fsS http://localhost:8080/actuator/health; then
+                echo "Health check succeeded"
+                docker image prune -f
+                exit 0
+              fi
+
+              echo "Waiting for application health check... ($i/30)"
+              sleep 3
+            done
+
+            echo "Health check failed"
+            docker logs dori-community-be
+            exit 1
