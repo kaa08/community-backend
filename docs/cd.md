@@ -264,6 +264,7 @@ ECR login
 -> 새 image pull
 -> 기존 dori-community-be container 삭제
 -> 새 image로 dori-community-be container 실행
+-> /actuator/health 확인
 -> unused image 정리
 ```
 
@@ -276,6 +277,23 @@ dori-mysql
 dori-community-be
 -> 새 image로 재실행
 ```
+
+배포 후에는 Actuator health endpoint로 애플리케이션이 정상 기동했는지 확인한다.
+
+```text
+GET /actuator/health
+-> 200 OK
+-> {"status":"UP"}
+```
+
+GitHub Actions deploy script는 최대 90초 동안 health check를 재시도한다.
+
+```text
+3초 간격
+최대 30회
+```
+
+health check가 실패하면 `docker logs dori-community-be`를 출력하고 workflow를 실패 처리한다.
 
 EC2 deploy step은 다음 GitHub Secrets를 사용한다.
 
