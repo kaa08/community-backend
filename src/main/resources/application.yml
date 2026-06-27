@@ -40,6 +40,15 @@ aws:
     bucket: ${AWS_S3_BUCKET}
   region: ${AWS_REGION:ap-northeast-2}
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
 logging:
   level:
     org.springframework.cache: TRACE
