@@ -2,6 +2,56 @@
 
 이 문서는 현재 프로젝트에서 CD를 위해 준비한 내용을 정리한다.
 
+## 현재 배포 구성 요약
+
+현재 프로젝트는 GitHub Actions, Amazon ECR, EC2, Docker를 사용해서 백엔드 애플리케이션을 자동 배포한다.
+
+구성 요소는 다음과 같다.
+
+| 구분 | 현재 구성 |
+| --- | --- |
+| Source repository | GitHub `kaa08/community-backend` |
+| CI/CD runner | GitHub Actions |
+| Container registry | Amazon ECR `community-ecr` |
+| Application server | EC2 |
+| Public IP | Elastic IP `3.38.56.109` |
+| Application container | `dori-community-be` |
+| Database container | `dori-mysql` |
+| Container network | `dori-net` |
+| External application port | `8080` |
+| Health check endpoint | `/actuator/health` |
+| Deploy trigger | `main`, `master` branch push |
+
+현재 백엔드 배포 흐름은 다음과 같다.
+
+```text
+GitHub main/master push
+-> GitHub Actions 실행
+-> compileJava
+-> test
+-> bootJar
+-> Docker image build
+-> OIDC 기반 AWS Role assume
+-> Amazon ECR login
+-> ECR에 image push
+-> SSH로 EC2 접속
+-> EC2에서 ECR image pull
+-> 기존 Spring Boot container 제거
+-> 새 Spring Boot container 실행
+-> /actuator/health 확인
+-> health check 성공 시 배포 성공 처리
+```
+
+현재 `dev` branch push와 pull request에서는 배포하지 않고 검증만 수행한다.
+
+```text
+pull_request, dev push
+-> compileJava
+-> test
+-> bootJar
+-> Docker image build
+```
+
 ## CD 정의
 
 CD는 Continuous Delivery 또는 Continuous Deployment의 줄임말로 사용된다.
@@ -295,6 +345,21 @@ GitHub Actions deploy script는 최대 90초 동안 health check를 재시도한
 
 health check가 실패하면 `docker logs dori-community-be`를 출력하고 workflow를 실패 처리한다.
 
+health check 성공 시 GitHub Actions 로그에는 다음과 같은 형태로 기록된다.
+
+```text
+{"status":"UP"}Health check succeeded
+```
+
+애플리케이션 기동 초기에 다음과 같은 응답이 잠시 발생할 수 있다.
+
+```text
+curl: (52) Empty reply from server
+curl: (56) Recv failure: Connection reset by peer
+```
+
+이는 Spring Boot 애플리케이션이 아직 완전히 요청을 처리할 준비가 되기 전의 일시적인 상태다. 재시도 중 최종적으로 `/actuator/health`가 `{"status":"UP"}`를 반환하면 배포 성공으로 판단한다.
+
 EC2 deploy step은 다음 GitHub Secrets를 사용한다.
 
 ```text
@@ -314,6 +379,54 @@ ECR_REPOSITORY
 ```
 
 시작 줄과 끝 줄을 포함하고, 줄바꿈을 유지해야 한다.
+
+macOS 터미널에서 private key를 복사할 때 마지막에 표시되는 `%` 문자는 shell prompt 표시이므로 GitHub Secret에 포함하지 않는다.
+
+## Actuator health check
+
+배포 성공 여부를 판단하기 위해 Spring Boot Actuator의 health endpoint를 사용한다.
+
+Actuator 의존성은 Spring Boot 애플리케이션에 추가되어 있다.
+
+```text
+spring-boot-starter-actuator
+```
+
+외부에서 health endpoint를 호출할 수 있도록 Spring Security 설정에서 다음 경로를 인증 없이 접근 가능하게 열어둔다.
+
+```text
+/actuator/health
+```
+
+노출하는 Actuator endpoint는 `health`로 제한한다.
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+```
+
+health check endpoint는 다음 응답을 기준으로 정상 여부를 판단한다.
+
+```text
+GET /actuator/health
+-> {"status":"UP"}
+```
+
+GitHub Actions deploy script에서는 새 container 실행 후 최대 30회까지 health check를 재시도한다.
+
+```text
+3초 간격
+최대 30회
+최대 약 90초 대기
+```
+
+health check가 끝까지 성공하지 못하면 배포 job은 실패한다.
 
 ## ECR image 배포 방식
 
