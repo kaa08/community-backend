@@ -89,7 +89,7 @@ jobs:
               --name dori-community-be \
               --network dori-net \
               --env-file ~/dori/.env \
-              -p 8080:8080 \
+              -p 127.0.0.1:8080:8080 \
               "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
             for i in $(seq 1 30); do
