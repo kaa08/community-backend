@@ -725,3 +725,148 @@ ECR image
 -> Spring Boot container 실행
 -> 외부에서 Swagger UI 접속
 ```
+
+## Nginx reverse proxy 구성
+
+Spring Boot container를 8080 port로 직접 호출하던 구조에서 Nginx를 앞단에 두는 구조를 추가했다.
+
+기존 구조는 다음과 같다.
+
+```text
+Client
+-> EC2:8080
+-> Spring Boot container
+```
+
+Nginx 적용 후 구조는 다음과 같다.
+
+```text
+Client
+-> EC2:80
+-> Nginx
+-> Spring Boot container:8080
+```
+
+프론트엔드는 별도로 S3/CloudFront 정적 배포를 고려하고 있으므로, 현재 Nginx는 React 정적 파일을 서빙하는 용도가 아니라 백엔드 API 앞단 reverse proxy 역할로 사용한다.
+
+### Nginx 설치 확인
+
+EC2에 Nginx를 설치하고 localhost 80 port 응답을 확인했다.
+
+```bash
+curl -I http://localhost
+```
+
+설치 직후에는 Nginx 기본 응답을 확인했다.
+
+```text
+HTTP/1.1 200 OK
+Server: nginx/1.24.0 (Ubuntu)
+```
+
+### Security Group
+
+외부에서 Nginx로 접근할 수 있도록 EC2 Security Group inbound rule에 HTTP 80 port를 추가했다.
+
+```text
+Type: HTTP
+Protocol: TCP
+Port: 80
+Source: 0.0.0.0/0
+```
+
+### Nginx proxy 설정
+
+Nginx site 설정은 Spring Boot container가 열려 있는 localhost 8080으로 요청을 전달하도록 구성했다.
+
+```nginx
+server {
+    listen 80;
+    server_name 3.38.56.109;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+설정 파일을 활성화한 뒤 Nginx 설정 문법을 확인하고 reload했다.
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### EC2 내부 확인
+
+Nginx가 80 port에서 외부 요청을 받을 수 있도록 listen 중인지 확인했다.
+
+```bash
+sudo ss -lntp | grep ':80'
+```
+
+확인된 상태는 다음과 같다.
+
+```text
+0.0.0.0:80
+-> nginx listen
+
+0.0.0.0:8080
+-> docker-proxy listen
+```
+
+Ubuntu 방화벽은 비활성 상태였다.
+
+```bash
+sudo ufw status
+```
+
+```text
+Status: inactive
+```
+
+EC2 내부에서 public IP로 호출했을 때도 Nginx를 통해 Spring Boot 응답이 반환되는 것을 확인했다.
+
+```bash
+curl -I http://3.38.56.109
+```
+
+```text
+HTTP/1.1 401
+Server: nginx/1.24.0 (Ubuntu)
+```
+
+`401` 응답은 Nginx 또는 Spring Boot 장애가 아니라, Spring Security가 인증이 필요한 요청에 대해 응답한 것이다.
+
+### 외부 접근 확인
+
+로컬 Mac에서 Nginx를 통해 Actuator health endpoint에 접근되는 것을 확인했다.
+
+```bash
+curl http://3.38.56.109/actuator/health
+```
+
+```json
+{"status":"UP"}
+```
+
+외부 브라우저에서는 Swagger UI 접근을 확인했다.
+
+```text
+http://3.38.56.109/swagger-ui/index.html
+```
+
+최종 확인된 요청 흐름은 다음과 같다.
+
+```text
+Local browser / curl
+-> http://3.38.56.109
+-> EC2 Security Group 80
+-> Nginx
+-> Spring Boot Docker container:8080
+```
