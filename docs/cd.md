@@ -18,7 +18,8 @@
 | Application container | `dori-community-be` |
 | Database container | `dori-mysql` |
 | Container network | `dori-net` |
-| External application port | `8080` |
+| External entrypoint | `https://api.dori-ka.cloud` |
+| Reverse proxy | Nginx `443 -> 127.0.0.1:8080` |
 | Health check endpoint | `/actuator/health` |
 | Deploy trigger | `main`, `master` branch push |
 
@@ -660,7 +661,9 @@ Custom TCP 8080
 -> source: 0.0.0.0/0
 ```
 
-현재는 Spring Boot container를 8080 port로 직접 노출한다.
+초기에는 Spring Boot container를 8080 port로 직접 노출했다.
+
+이후 Nginx reverse proxy와 HTTPS를 적용하면서 외부 8080 inbound rule은 제거하고, Spring Boot container는 localhost에서만 접근 가능하도록 변경했다.
 
 ### Docker 설치 확인
 
@@ -763,6 +766,17 @@ docker run -d \
   783728775565.dkr.ecr.ap-northeast-2.amazonaws.com/community-ecr:bfc06070ed0b4364ae7b3f879a594ef3f8264c13
 ```
 
+Nginx 적용 이후에는 Spring Boot container를 외부에 직접 노출하지 않고 localhost에만 바인딩한다.
+
+```bash
+docker run -d \
+  --name dori-community-be \
+  --network dori-net \
+  --env-file ~/dori/.env \
+  -p 127.0.0.1:8080:8080 \
+  783728775565.dkr.ecr.ap-northeast-2.amazonaws.com/community-ecr:{IMAGE_TAG}
+```
+
 ### Container 상태 확인
 
 실행 중인 container는 다음 명령으로 확인했다.
@@ -855,7 +869,7 @@ Nginx 적용 후 구조는 다음과 같다.
 
 ```text
 Client
--> EC2:80
+-> EC2:80 or 443
 -> Nginx
 -> Spring Boot container:8080
 ```
@@ -895,7 +909,7 @@ Nginx site 설정은 Spring Boot container가 열려 있는 localhost 8080으로
 ```nginx
 server {
     listen 80;
-    server_name 3.38.56.109;
+    server_name api.dori-ka.cloud;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
@@ -983,3 +997,295 @@ Local browser / curl
 -> Nginx
 -> Spring Boot Docker container:8080
 ```
+
+도메인과 HTTPS 적용 이후에는 `api.dori-ka.cloud` 기준으로 Nginx server block을 수정했다.
+
+## Domain과 Route 53 연결
+
+백엔드 API를 Elastic IP로 직접 호출하던 구조에서 도메인 기반으로 접근할 수 있도록 `dori-ka.cloud` 도메인을 연결했다.
+
+구성한 도메인은 다음과 같다.
+
+```text
+Root domain: dori-ka.cloud
+Backend API domain: api.dori-ka.cloud
+```
+
+도메인은 가비아에서 구매했고, DNS 관리는 AWS Route 53 Hosted Zone으로 위임했다.
+
+```text
+Domain registrar
+-> Gabia
+
+DNS hosting
+-> AWS Route 53
+```
+
+### Route 53 Hosted Zone
+
+Route 53에서 `dori-ka.cloud` public hosted zone을 생성했다.
+
+Hosted Zone 생성 후 발급된 NS record는 다음과 같다.
+
+```text
+ns-984.awsdns-59.net
+ns-1698.awsdns-20.co.uk
+ns-1270.awsdns-30.org
+ns-507.awsdns-63.com
+```
+
+가비아 도메인 관리 화면에서 기존 가비아 네임서버를 위 Route 53 네임서버 4개로 변경했다.
+
+```text
+Gabia nameserver
+-> Route 53 NS
+```
+
+네임서버 위임 상태는 `dig +trace`로 확인했다.
+
+```bash
+dig +trace dori-ka.cloud NS
+```
+
+정상 위임 후 `.cloud` 상위 네임서버가 Route 53 네임서버를 반환하는 것을 확인했다.
+
+```text
+dori-ka.cloud. IN NS ns-507.awsdns-63.com.
+dori-ka.cloud. IN NS ns-1270.awsdns-30.org.
+dori-ka.cloud. IN NS ns-984.awsdns-59.net.
+dori-ka.cloud. IN NS ns-1698.awsdns-20.co.uk.
+```
+
+### Backend API record
+
+Route 53 Hosted Zone에 백엔드 API용 A record를 생성했다.
+
+```text
+Record name: api.dori-ka.cloud
+Type: A
+Value: 3.38.56.109
+```
+
+DNS 조회 결과 `api.dori-ka.cloud`가 EC2 Elastic IP로 해석되는 것을 확인했다.
+
+```bash
+nslookup api.dori-ka.cloud
+```
+
+```text
+Name: api.dori-ka.cloud
+Address: 3.38.56.109
+```
+
+도메인 기반으로 Actuator health endpoint에 접근되는 것도 확인했다.
+
+```bash
+curl http://api.dori-ka.cloud/actuator/health
+```
+
+```json
+{"status":"UP"}
+```
+
+최종 백엔드 API 접근 흐름은 다음과 같다.
+
+```text
+Client
+-> http://api.dori-ka.cloud
+-> Route 53
+-> EC2 Elastic IP 3.38.56.109
+-> Nginx:80
+-> Spring Boot Docker container:8080
+```
+
+## Backend HTTPS 적용
+
+프론트엔드를 HTTPS로 배포하면 브라우저에서 HTTP API 호출이 Mixed Content로 차단될 수 있다. 따라서 백엔드 API 도메인인 `api.dori-ka.cloud`에도 HTTPS를 적용했다.
+
+인증서는 Let's Encrypt와 Certbot을 사용해서 발급했다.
+
+```bash
+sudo apt update
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d api.dori-ka.cloud
+```
+
+처음 인증서 발급은 성공했지만, Certbot이 Nginx server block을 자동으로 찾지 못해 Nginx 설정 적용에는 실패했다.
+
+```text
+Certificate is saved at: /etc/letsencrypt/live/api.dori-ka.cloud/fullchain.pem
+Key is saved at: /etc/letsencrypt/live/api.dori-ka.cloud/privkey.pem
+Could not automatically find a matching server block for api.dori-ka.cloud
+```
+
+원인은 실제로 활성화된 Nginx 설정 파일이 `/etc/nginx/sites-available/default`가 아니라 `/etc/nginx/sites-available/dori-community`였기 때문이다.
+
+활성화된 site 설정은 다음 명령으로 확인했다.
+
+```bash
+sudo ls -l /etc/nginx/sites-enabled/
+```
+
+확인된 symlink는 다음과 같다.
+
+```text
+/etc/nginx/sites-enabled/dori-community
+-> /etc/nginx/sites-available/dori-community
+```
+
+따라서 실제 사용 중인 설정 파일의 `server_name`을 `api.dori-ka.cloud`로 수정했다.
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+
+    server_name api.dori-ka.cloud;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Nginx 설정 반영 후 이미 발급된 인증서를 Nginx에 설치했다.
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot install --cert-name api.dori-ka.cloud
+```
+
+Certbot 적용 후 Nginx 설정에는 443 SSL server block과 80 -> 443 redirect server block이 추가됐다.
+
+```text
+listen 443 ssl;
+ssl_certificate /etc/letsencrypt/live/api.dori-ka.cloud/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/api.dori-ka.cloud/privkey.pem;
+```
+
+Nginx가 443 port를 listen 중인지 확인했다.
+
+```bash
+sudo ss -lntp | grep ':443'
+```
+
+확인 결과 Nginx가 IPv4와 IPv6에서 443 port를 listen 중이었다.
+
+```text
+0.0.0.0:443
+-> nginx
+
+[::]:443
+-> nginx
+```
+
+EC2 내부에서는 HTTPS reverse proxy가 정상 동작하는 것을 확인했다.
+
+```bash
+curl -k https://localhost/actuator/health
+```
+
+```json
+{"status":"UP"}
+```
+
+외부에서 HTTPS로 접근할 수 있도록 EC2 Security Group에 443 inbound rule을 추가했다.
+
+```text
+Type: HTTPS
+Protocol: TCP
+Port: 443
+Source: 0.0.0.0/0
+```
+
+로컬 Mac에서도 백엔드 HTTPS health check가 성공하는 것을 확인했다.
+
+```bash
+curl https://api.dori-ka.cloud/actuator/health
+```
+
+```json
+{"status":"UP"}
+```
+
+현재 백엔드 API 요청 흐름은 다음과 같다.
+
+```text
+Client
+-> https://api.dori-ka.cloud
+-> Route 53
+-> EC2 Elastic IP 3.38.56.109
+-> Security Group 443
+-> Nginx HTTPS
+-> 127.0.0.1:8080
+-> Spring Boot Docker container
+```
+
+## Frontend S3 정적 배포와 Backend API 연동
+
+프론트엔드는 Vite React 프로젝트를 build한 뒤 S3 정적 웹사이트 호스팅으로 배포했다.
+
+프론트엔드 프로젝트 경로는 다음과 같다.
+
+```text
+/Users/kahansol/Desktop/kakao/dori-week8-js/community-react
+```
+
+배포 대상은 Vite build 결과물인 `dist/`이다.
+
+```bash
+npm run build
+aws s3 sync dist/ s3://dori-community-fe --delete
+```
+
+S3 정적 웹사이트 설정은 다음과 같이 구성했다.
+
+```text
+Index document: index.html
+Error document: index.html
+```
+
+`Error document`도 `index.html`로 설정해서 React Router 기반 SPA 경로에서 새로고침하더라도 `index.html`을 반환하도록 했다.
+
+프론트엔드 S3 정적 웹사이트 endpoint는 다음과 같다.
+
+```text
+http://dori-community-fe.s3-website.ap-northeast-2.amazonaws.com
+```
+
+### Frontend API base URL
+
+프론트엔드에서 백엔드 API 주소를 코드에 직접 고정하지 않고 Vite 환경변수로 분리했다.
+
+```javascript
+baseURL: import.meta.env.VITE_API_BASE_URL
+```
+
+production build에서는 `.env.production`에 백엔드 API 도메인을 설정했다.
+
+```env
+VITE_API_BASE_URL=http://api.dori-ka.cloud
+```
+
+Vite의 `VITE_` 환경변수는 build 시점에 브라우저 JavaScript bundle에 포함된다. 따라서 API base URL처럼 공개되어도 되는 설정값만 저장한다.
+
+프론트엔드에서 확인한 연동 흐름은 다음과 같다.
+
+```text
+S3 static website
+-> React application
+-> http://api.dori-ka.cloud
+-> Route 53
+-> EC2 Nginx
+-> Spring Boot
+```
+
+프론트엔드 화면에서 백엔드 API 호출과 이미지 조회가 정상 동작하는 것을 확인했다.
