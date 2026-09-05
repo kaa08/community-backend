@@ -1,88 +1,89 @@
 # CD
 
-이 문서는 현재 프로젝트에서 CD를 위해 준비한 내용을 정리한다.
+이 문서는 Dori Community 프로젝트에서 구성한 배포 인프라와 CD 흐름을 정리한다.
 
-## 현재 배포 구성 요약
+## 전체 구성 요약
 
-현재 프로젝트는 GitHub Actions, Amazon ECR, EC2, Docker를 사용해서 백엔드 애플리케이션을 자동 배포한다.
-
-구성 요소는 다음과 같다.
+현재 프로젝트는 백엔드와 프론트엔드를 분리해서 배포한다.
 
 | 구분 | 현재 구성 |
 | --- | --- |
-| Source repository | GitHub `kaa08/community-backend` |
+| Backend repository | GitHub `kaa08/community-backend` |
+| Frontend repository | GitHub `kaa08/community-FE` |
+| Backend runtime | Spring Boot, Docker |
+| Frontend runtime | Vite React 정적 빌드 |
+| Backend image registry | Amazon ECR `community-ecr` |
+| Backend server | EC2 |
+| Backend domain | `https://api.dori-ka.cloud` |
+| Frontend hosting | S3 `dori-community-fe` |
+| Frontend CDN | CloudFront |
+| Frontend domain | `https://dori-ka.cloud`, `https://www.dori-ka.cloud` |
+| DNS | Route 53 Hosted Zone |
+| Backend TLS | Let's Encrypt, Certbot, Nginx |
+| Frontend TLS | ACM `us-east-1`, CloudFront |
 | CI/CD runner | GitHub Actions |
-| Container registry | Amazon ECR `community-ecr` |
-| Application server | EC2 |
-| Public IP | Elastic IP `3.38.56.109` |
-| Application container | `dori-community-be` |
-| Database container | `dori-mysql` |
-| Container network | `dori-net` |
-| External entrypoint | `https://api.dori-ka.cloud` |
-| Reverse proxy | Nginx `443 -> 127.0.0.1:8080` |
-| Health check endpoint | `/actuator/health` |
-| Deploy trigger | `main`, `master` branch push |
 
-현재 백엔드 배포 흐름은 다음과 같다.
+전체 요청 흐름은 다음과 같다.
 
 ```text
-GitHub main/master push
--> GitHub Actions 실행
+Client
+-> https://dori-ka.cloud
+-> Route 53
+-> CloudFront
+-> S3 dori-community-fe
+-> React application
+
+React application
+-> https://api.dori-ka.cloud
+-> Route 53
+-> EC2 Elastic IP
+-> Nginx HTTPS reverse proxy
+-> Spring Boot Docker container
+-> MySQL container
+```
+
+## CD 정의
+
+CD는 Continuous Delivery 또는 Continuous Deployment의 줄임말이다.
+
+이 프로젝트에서 CD는 다음 의미로 사용한다.
+
+```text
+코드가 main/master 브랜치에 반영되면
+GitHub Actions가 빌드, 검증, 업로드, 배포를 자동으로 수행한다.
+```
+
+현재 배포는 다음 기준으로 나뉜다.
+
+| 이벤트 | 백엔드 동작 | 프론트엔드 동작 |
+| --- | --- | --- |
+| Pull Request | compile, test, bootJar, Docker build 검증 | npm ci, lint, build 검증 |
+| dev push | 배포 없이 검증만 수행 | 배포 없이 검증만 수행 |
+| main/master push | ECR push 후 EC2 배포 | S3 업로드 후 CloudFront 캐시 무효화 |
+
+## Backend 배포 구성
+
+백엔드는 Docker image로 패키징한 뒤 ECR에 저장하고, EC2에서 해당 image를 pull해서 실행한다.
+
+```text
+GitHub Actions
 -> compileJava
 -> test
 -> bootJar
 -> Docker image build
 -> OIDC 기반 AWS Role assume
 -> Amazon ECR login
--> ECR에 image push
+-> ECR image push
 -> SSH로 EC2 접속
 -> EC2에서 ECR image pull
 -> 기존 Spring Boot container 제거
 -> 새 Spring Boot container 실행
--> /actuator/health 확인
--> health check 성공 시 배포 성공 처리
+-> Actuator health check
 ```
 
-현재 `dev` branch push와 pull request에서는 배포하지 않고 검증만 수행한다.
+### Amazon ECR
 
-```text
-pull_request, dev push
--> compileJava
--> test
--> bootJar
--> Docker image build
-```
-
-## CD 정의
-
-CD는 Continuous Delivery 또는 Continuous Deployment의 줄임말로 사용된다.
-
-이 프로젝트에서 현재 구성한 CD 흐름은 다음과 같다.
-
-```text
-GitHub Actions
--> Docker image build
--> Amazon ECR login
--> ECR repository에 image push
--> SSH로 EC2 접속
--> EC2에서 ECR image pull
--> Spring Boot container 재실행
-```
-
-현재 단계에서는 ECR push와 EC2 app container 재배포를 GitHub Actions로 자동화했다.
-
-```text
-ECR과 AWS 인증 기반 준비
-GitHub Actions ECR push
-EC2 Docker 수동 배포
-GitHub Actions EC2 SSH 배포
-```
-
-## Amazon ECR
-
-CD에서 Docker image를 저장할 registry로 Amazon ECR을 사용하기로 했다.
-
-생성한 ECR repository 정보는 다음과 같다.
+Docker image 저장소로 Amazon ECR을 사용한다.
 
 ```text
 AWS account ID: 783728775565
@@ -91,13 +92,425 @@ Repository name: community-ecr
 Repository URI: 783728775565.dkr.ecr.ap-northeast-2.amazonaws.com/community-ecr
 ```
 
-ECR은 AWS에서 제공하는 private container registry이다. Docker image를 ECR에 push해두면, 이후 EC2/ECS/EKS 같은 AWS 실행 환경에서 해당 image를 pull해서 실행할 수 있다.
-
-ECR push 성공 후 `community-ecr` repository에서 image가 생성된 것을 확인했다.
+image tag는 GitHub commit SHA를 사용한다.
 
 ```text
-Repository: community-ecr
-Image tag: bfc06070ed0b4364ae7b3f879a594ef3f8264c13
+783728775565.dkr.ecr.ap-northeast-2.amazonaws.com/community-ecr:${{ github.sha }}
+```
+
+### EC2
+
+백엔드 애플리케이션은 EC2에서 Docker container로 실행한다.
+
+```text
+Elastic IP: 3.38.56.109
+Application container: dori-community-be
+Database container: dori-mysql
+Docker network: dori-net
+```
+
+현재 RDS는 사용하지 않고, EC2 내부에서 MySQL container를 함께 실행한다.
+
+```text
+dori-community-be
+-> jdbc:mysql://dori-mysql:3306/pracdb
+
+dori-mysql
+-> mysql:8.4
+```
+
+Spring Boot container 실행 시 환경변수는 EC2의 `~/dori/.env` 파일로 주입한다.
+
+```text
+DB_URL
+DB_USERNAME
+DB_PASSWORD
+JWT_SECRET
+JWT_TOKEN_EXPIRATION_TIME
+JWT_REFRESH_EXPIRATION_TIME
+AWS_ACCESS_KEY
+AWS_SECRET_KEY
+AWS_S3_BUCKET
+AWS_REGION
+```
+
+### Nginx reverse proxy
+
+외부 요청은 Spring Boot container에 직접 들어가지 않고 Nginx를 거친다.
+
+```text
+Client
+-> Nginx 443
+-> 127.0.0.1:8080
+-> Spring Boot container
+```
+
+Spring Boot container는 외부에 직접 8080 port를 열지 않고 localhost에만 바인딩한다.
+
+```bash
+docker run -d \
+  --name dori-community-be \
+  --network dori-net \
+  --env-file ~/dori/.env \
+  -p 127.0.0.1:8080:8080 \
+  "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+```
+
+이 구조에서는 EC2 Security Group에서 8080 inbound를 열 필요가 없다.
+
+현재 외부 접근에 필요한 inbound rule은 다음과 같다.
+
+| Type | Port | Source |
+| --- | --- | --- |
+| HTTP | 80 | 0.0.0.0/0 |
+| HTTPS | 443 | 0.0.0.0/0 |
+| SSH | 22 | 작업자 IP |
+
+### Backend HTTPS
+
+백엔드 API 도메인은 `api.dori-ka.cloud`이다.
+
+```text
+api.dori-ka.cloud
+-> Route 53 A record
+-> EC2 Elastic IP 3.38.56.109
+```
+
+HTTPS 인증서는 Let's Encrypt와 Certbot으로 발급했다.
+
+```bash
+sudo certbot --nginx -d api.dori-ka.cloud
+```
+
+Nginx는 `api.dori-ka.cloud`에 대해 443 HTTPS 요청을 받고 Spring Boot container로 proxy한다.
+
+```text
+https://api.dori-ka.cloud
+-> Nginx 443
+-> http://127.0.0.1:8080
+```
+
+정상 동작은 다음 명령으로 확인했다.
+
+```bash
+curl https://api.dori-ka.cloud/actuator/health
+```
+
+```json
+{"status":"UP"}
+```
+
+### Actuator health check
+
+배포 성공 여부를 확인하기 위해 Spring Boot Actuator health endpoint를 사용한다.
+
+```text
+GET /actuator/health
+-> {"status":"UP"}
+```
+
+GitHub Actions deploy step에서는 새 container 실행 후 health check를 최대 30회 재시도한다.
+
+```text
+3초 간격
+최대 30회
+최대 약 90초 대기
+```
+
+health check가 성공하면 배포 성공으로 처리하고, 실패하면 container log를 출력한 뒤 job을 실패 처리한다.
+
+## Backend GitHub Actions
+
+백엔드 workflow 파일은 다음 위치에 있다.
+
+```text
+.github/workflows/ci-cd.yml
+```
+
+`pull_request`, `dev push`에서는 검증만 수행한다.
+
+```text
+compileJava
+-> test
+-> bootJar
+-> Docker image build
+```
+
+`main`, `master` push에서는 검증 후 배포까지 수행한다.
+
+```text
+compileJava
+-> test
+-> bootJar
+-> Docker image build
+-> ECR push
+-> EC2 deploy
+-> health check
+```
+
+GitHub Actions가 AWS에 접근할 때 장기 access key를 저장하지 않고 OIDC 기반 IAM Role을 사용한다.
+
+```text
+GitHub Actions
+-> OIDC token 발급
+-> AWS IAM Role assume
+-> 임시 AWS 권한 획득
+-> ECR push 수행
+```
+
+백엔드 배포에 사용하는 GitHub Secrets는 다음과 같다.
+
+```text
+AWS_ROLE_ARN=arn:aws:iam::783728775565:role/github-actions-ecr-push-role
+AWS_REGION=ap-northeast-2
+ECR_REPOSITORY=community-ecr
+EC2_HOST=3.38.56.109
+EC2_USER=ubuntu
+EC2_SSH_KEY={EC2 private key}
+```
+
+`EC2_SSH_KEY`에는 private key의 시작 줄과 끝 줄을 포함한다.
+
+```text
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+```
+
+터미널 복사 시 마지막에 보이는 `%` 문자는 shell prompt 표시이므로 secret에 포함하지 않는다.
+
+## Frontend 배포 구성
+
+프론트엔드는 Vite React 프로젝트를 build한 뒤 S3에 정적 파일로 업로드하고, CloudFront를 통해 사용자에게 제공한다.
+
+```text
+Vite React
+-> npm run build
+-> dist/
+-> S3 dori-community-fe
+-> CloudFront
+-> dori-ka.cloud
+```
+
+현재 프론트엔드 구성은 다음과 같다.
+
+| 구분 | 현재 구성 |
+| --- | --- |
+| Repository | GitHub `kaa08/community-FE` |
+| Project directory | `community-react` |
+| Build output | `community-react/dist` |
+| S3 bucket | `dori-community-fe` |
+| CloudFront distribution ID | `E3QWPRQ2JSY34P` |
+| CloudFront domain | `di5zfhyzvjs5q.cloudfront.net` |
+| Domain | `dori-ka.cloud`, `www.dori-ka.cloud` |
+| Certificate | ACM `us-east-1` |
+
+### Frontend API base URL
+
+프론트엔드에서 백엔드 API 주소는 Vite 환경변수로 분리했다.
+
+```javascript
+baseURL: import.meta.env.VITE_API_BASE_URL
+```
+
+production build에서는 다음 값을 사용한다.
+
+```env
+VITE_API_BASE_URL=https://api.dori-ka.cloud
+```
+
+`VITE_` 환경변수는 build 결과물에 포함된다. 따라서 비밀값이 아니라 브라우저에 공개되어도 되는 값만 넣는다.
+
+### S3
+
+S3 bucket에는 Vite build 결과물인 `dist/` 내부 파일을 업로드한다.
+
+```bash
+npm run build
+aws s3 sync dist/ s3://dori-community-fe --delete
+```
+
+초기에는 S3 정적 웹사이트 호스팅만 사용했지만, 최종 구성에서는 CloudFront를 앞단에 두었다.
+
+```text
+Client
+-> CloudFront
+-> S3 bucket
+```
+
+CloudFront에서 private S3 bucket access를 허용하도록 설정했다. 이 구성에서는 사용자가 S3 bucket에 직접 접근하는 대신 CloudFront를 통해 정적 파일을 조회한다.
+
+### CloudFront
+
+CloudFront는 S3의 정적 파일을 CDN으로 제공하고, 사용자 도메인과 HTTPS를 담당한다.
+
+```text
+CloudFront alternate domain names:
+- dori-ka.cloud
+- www.dori-ka.cloud
+```
+
+CloudFront는 global service이므로 distribution 자체는 특정 region에 종속되지 않는다. 다만 CloudFront에 연결할 ACM 인증서는 `us-east-1` region에서 발급해야 한다.
+
+### ACM certificate
+
+프론트엔드 사용자 도메인에 HTTPS를 적용하기 위해 ACM 인증서를 발급했다.
+
+```text
+Region: us-east-1
+Domains:
+- dori-ka.cloud
+- www.dori-ka.cloud
+Validation method: DNS validation
+```
+
+ACM에서 제공한 CNAME record를 Route 53에 추가해서 DNS 검증을 완료했다.
+
+### Route 53
+
+가비아에서 구매한 `dori-ka.cloud` 도메인의 네임서버를 Route 53 Hosted Zone으로 위임했다.
+
+Route 53 Hosted Zone의 NS record는 다음과 같다.
+
+```text
+ns-984.awsdns-59.net
+ns-1698.awsdns-20.co.uk
+ns-1270.awsdns-30.org
+ns-507.awsdns-63.com
+```
+
+프론트엔드 도메인은 CloudFront distribution으로 alias 연결했다.
+
+```text
+dori-ka.cloud
+-> A Alias
+-> CloudFront distribution
+
+www.dori-ka.cloud
+-> A Alias
+-> CloudFront distribution
+```
+
+백엔드 API 도메인은 EC2 Elastic IP로 연결했다.
+
+```text
+api.dori-ka.cloud
+-> A record
+-> 3.38.56.109
+```
+
+### React Router SPA fallback
+
+React Router는 `/login`, `/posts` 같은 경로를 브라우저에서 처리한다. 사용자가 해당 경로를 직접 열거나 새로고침하면 CloudFront와 S3는 실제 object를 찾으려고 한다.
+
+이를 해결하기 위해 CloudFront custom error response를 설정했다.
+
+```text
+403 -> /index.html -> HTTP 200
+404 -> /index.html -> HTTP 200
+```
+
+이 설정으로 `/login` 같은 SPA 경로를 직접 열어도 React application이 정상 렌더링된다.
+
+### Frontend HTTPS 확인
+
+프론트엔드 HTTPS 응답은 다음 명령으로 확인했다.
+
+```bash
+curl -I https://dori-ka.cloud
+curl -I https://www.dori-ka.cloud
+```
+
+확인된 주요 응답은 다음과 같다.
+
+```text
+HTTP/2 200
+server: AmazonS3
+x-cache: Miss from cloudfront
+via: ...cloudfront.net (CloudFront)
+```
+
+## Frontend GitHub Actions
+
+프론트엔드 workflow 파일은 repository root에 둔다.
+
+```text
+.github/workflows/ci-cd.yml
+```
+
+프론트엔드 repository 안에서 실제 Vite 프로젝트는 `community-react` 하위에 있으므로 GitHub Actions의 working directory를 `community-react`로 설정한다.
+
+```yaml
+defaults:
+  run:
+    working-directory: community-react
+```
+
+`pull_request`, `dev push`에서는 build 검증만 수행한다.
+
+```text
+npm ci
+-> npm run lint
+-> npm run build
+```
+
+`main`, `master` push에서는 build 후 S3와 CloudFront에 배포한다.
+
+```text
+npm ci
+-> npm run lint
+-> npm run build
+-> upload artifact
+-> download artifact
+-> AWS Role assume
+-> S3 sync
+-> CloudFront invalidation
+```
+
+프론트엔드 배포에 사용하는 GitHub Secrets는 다음과 같다.
+
+```text
+AWS_ROLE_ARN={frontend deploy role arn}
+AWS_REGION=ap-northeast-2
+S3_BUCKET=dori-community-fe
+CLOUDFRONT_DISTRIBUTION_ID=E3QWPRQ2JSY34P
+```
+
+프론트엔드 배포용 IAM Role은 S3 업로드와 CloudFront invalidation 권한을 가진다.
+
+```text
+s3:ListBucket
+s3:GetObject
+s3:PutObject
+s3:DeleteObject
+cloudfront:CreateInvalidation
+```
+
+## CORS
+
+프론트엔드 도메인이 CloudFront 사용자 도메인으로 변경되면서 백엔드 CORS 허용 origin도 함께 설정했다.
+
+허용한 production frontend origin은 다음과 같다.
+
+```text
+https://dori-ka.cloud
+https://www.dori-ka.cloud
+```
+
+CORS preflight는 다음 명령으로 확인했다.
+
+```bash
+curl -i -X OPTIONS 'https://api.dori-ka.cloud/auth/login' \
+  -H 'Origin: https://dori-ka.cloud' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type,authorization'
+```
+
+정상 응답에는 다음 header가 포함된다.
+
+```text
+Access-Control-Allow-Origin: https://dori-ka.cloud
+Access-Control-Allow-Credentials: true
 ```
 
 ## Container Registry 비교
@@ -111,338 +524,12 @@ Docker image를 저장하는 registry는 여러 선택지가 있다. 현재 프�
 | 인증 | AWS IAM, OIDC, ECR login | Docker Hub 계정/token | GitHub token, GitHub Actions 권한 |
 | AWS 연동 | 좋음 | 별도 인증 필요 | 별도 인증 필요 |
 | GitHub Actions 연동 | OIDC 설정이 필요하지만 장기 access key 없이 가능 | Docker Hub token을 secret에 저장 | GitHub Actions와 쉽게 연동 |
-| 공개 image 배포 | 가능하지만 주로 private 용도 | 가장 익숙하고 공개 image 생태계가 큼 | GitHub repository 중심으로 관리하기 좋음 |
 | private image 관리 | AWS IAM으로 세밀하게 제어 가능 | plan/정책 확인 필요 | GitHub package 권한과 연결 |
 | 이 프로젝트에서의 적합성 | AWS에 배포할 예정이므로 적합 | 공개 image 공유에는 단순함 | GitHub 중심 프로젝트에는 적합하지만 AWS 실행 환경과는 한 단계 더 연결 필요 |
 
-정리하면 다음과 같다.
-
-```text
-AWS 배포 중심
--> ECR
-
-가장 범용적인 Docker image 공유
--> Docker Hub
-
-GitHub repository와 package를 함께 관리
--> GHCR
-```
-
-## AWS CLI 관리자 사용자
-
-초기에는 root 계정 access key로 AWS CLI를 사용하고 있었지만, root access key를 계속 사용하는 방식은 위험하다.
-
-따라서 root 대신 사용할 IAM 관리자 사용자를 생성했다.
-
-```text
-IAM user: admin-kahansol
-Policy: AdministratorAccess
-```
-
-로컬 AWS CLI도 `admin-kahansol` access key로 다시 설정했다.
-
-정상 설정 여부는 다음 명령으로 확인했다.
-
-```bash
-aws sts get-caller-identity
-```
-
-정상적으로 설정되면 ARN이 root가 아니라 IAM user로 표시된다.
-
-```text
-arn:aws:iam::783728775565:user/admin-kahansol
-```
-
-root access key는 장기 보관하지 않고 삭제해야 한다. GitHub Actions에도 root access key를 넣지 않는다.
-
-## GitHub Actions OIDC
-
-GitHub Actions가 AWS에 접근할 때 장기 access key를 GitHub Secrets에 저장하지 않고, OIDC 기반으로 IAM Role을 assume하도록 구성한다.
-
-AWS 계정에 GitHub OIDC Provider가 있는지 확인했다.
-
-```bash
-aws iam list-open-id-connect-providers
-```
-
-확인된 OIDC Provider는 다음과 같다.
-
-```text
-arn:aws:iam::783728775565:oidc-provider/token.actions.githubusercontent.com
-```
-
-GitHub Actions가 assume할 IAM Role은 다음 이름으로 준비했다.
-
-```text
-Role name: github-actions-ecr-push-role
-Role ARN: arn:aws:iam::783728775565:role/github-actions-ecr-push-role
-```
-
-이 Role은 GitHub Actions에서 ECR에 image를 push할 때 사용할 역할이다. Trust policy에서는 GitHub repository와 브랜치 조건을 제한한다.
-
-```text
-Repository: kaa08/community-backend
-Allowed branches: dev, main, master
-```
-
-이 구조에서는 GitHub Actions에 AWS access key를 직접 저장하지 않는다. GitHub Actions가 OIDC token을 발급받고, AWS IAM Role이 그 token을 신뢰해서 임시 권한을 발급한다.
-
-```text
-GitHub Actions
--> OIDC token 발급
--> AWS IAM Role assume
--> 임시 AWS 권한 획득
--> ECR push 수행
-```
-
-## ECR push 권한
-
-ECR push Role에는 `community-ecr` repository에 image를 push할 수 있는 권한을 부여한다.
-
-```text
-ecr:GetAuthorizationToken
-ecr:BatchCheckLayerAvailability
-ecr:InitiateLayerUpload
-ecr:UploadLayerPart
-ecr:CompleteLayerUpload
-ecr:PutImage
-ecr:DescribeRepositories
-```
-
-## GitHub Secrets
-
-GitHub Actions에서 사용할 repository secrets는 다음과 같다.
-
-```text
-AWS_ROLE_ARN=arn:aws:iam::783728775565:role/github-actions-ecr-push-role
-AWS_REGION=ap-northeast-2
-ECR_REPOSITORY=community-ecr
-EC2_HOST=3.38.56.109
-EC2_USER=ubuntu
-EC2_SSH_KEY={EC2 private key}
-```
-
-AWS 관련 값은 GitHub Actions workflow에서 AWS Role assume과 ECR push에 사용된다.
-
-EC2 관련 값은 GitHub Actions가 SSH로 EC2에 접속해 app container를 재배포할 때 사용된다.
-
-## GitHub Actions ECR push
-
-CI/CD workflow에 ECR push 단계를 추가했다.
-
-```text
-.github/workflows/ci-cd.yml
-```
-
-PR에서는 기존처럼 검증만 수행한다.
-
-```text
-compileJava
--> test
--> bootJar
--> docker build
-```
-
-`main`, `master` 브랜치에 push될 때는 Docker image를 ECR에 push하고, EC2에 SSH로 접속해 app container를 재배포한다.
-
-`dev` 브랜치 push에서는 compile, test, bootJar, docker build 검증까지만 수행한다.
-
-```text
-main/master push
--> compileJava
--> test
--> bootJar
--> docker build
--> AWS Role assume
--> Amazon ECR login
--> ECR push
--> SSH to EC2
--> docker pull
--> docker rm -f dori-community-be
--> docker run
-```
-
-OIDC를 사용하려면 GitHub Actions workflow에 다음 권한이 필요하다.
-
-```yaml
-permissions:
-  contents: read
-  id-token: write
-```
-
-현재 image tag는 commit SHA를 사용한다.
-
-```text
-783728775565.dkr.ecr.ap-northeast-2.amazonaws.com/community-ecr:${{ github.sha }}
-```
-
-## GitHub Actions EC2 deploy
-
-ECR push 이후 GitHub Actions에서 EC2에 SSH로 접속해 Spring Boot app container를 재실행하도록 구성했다.
-
-```text
-.github/workflows/ci-cd.yml
-```
-
-EC2 SSH deploy는 `main`, `master` push event에서만 실행된다.
-
-```text
-pull_request
--> compileJava
--> test
--> bootJar
--> docker build
-
-push to dev
--> compileJava
--> test
--> bootJar
--> docker build
-
-push to main/master
--> compileJava
--> test
--> bootJar
--> docker build
--> ECR push
--> EC2 deploy
-```
-
-EC2 deploy에서 실행하는 작업은 다음과 같다.
-
-```text
-ECR login
--> 새 image pull
--> 기존 dori-community-be container 삭제
--> 새 image로 dori-community-be container 실행
--> /actuator/health 확인
--> unused image 정리
-```
-
-EC2 deploy는 app container만 교체한다.
-
-```text
-dori-mysql
--> 유지
-
-dori-community-be
--> 새 image로 재실행
-```
-
-배포 후에는 Actuator health endpoint로 애플리케이션이 정상 기동했는지 확인한다.
-
-```text
-GET /actuator/health
--> 200 OK
--> {"status":"UP"}
-```
-
-GitHub Actions deploy script는 최대 90초 동안 health check를 재시도한다.
-
-```text
-3초 간격
-최대 30회
-```
-
-health check가 실패하면 `docker logs dori-community-be`를 출력하고 workflow를 실패 처리한다.
-
-health check 성공 시 GitHub Actions 로그에는 다음과 같은 형태로 기록된다.
-
-```text
-{"status":"UP"}Health check succeeded
-```
-
-애플리케이션 기동 초기에 다음과 같은 응답이 잠시 발생할 수 있다.
-
-```text
-curl: (52) Empty reply from server
-curl: (56) Recv failure: Connection reset by peer
-```
-
-이는 Spring Boot 애플리케이션이 아직 완전히 요청을 처리할 준비가 되기 전의 일시적인 상태다. 재시도 중 최종적으로 `/actuator/health`가 `{"status":"UP"}`를 반환하면 배포 성공으로 판단한다.
-
-EC2 deploy step은 다음 GitHub Secrets를 사용한다.
-
-```text
-EC2_HOST
-EC2_USER
-EC2_SSH_KEY
-AWS_REGION
-ECR_REPOSITORY
-```
-
-`EC2_SSH_KEY`에는 EC2 key pair private key 전체 내용을 저장한다.
-
-```text
------BEGIN OPENSSH PRIVATE KEY-----
-...
------END OPENSSH PRIVATE KEY-----
-```
-
-시작 줄과 끝 줄을 포함하고, 줄바꿈을 유지해야 한다.
-
-macOS 터미널에서 private key를 복사할 때 마지막에 표시되는 `%` 문자는 shell prompt 표시이므로 GitHub Secret에 포함하지 않는다.
-
-## Actuator health check
-
-배포 성공 여부를 판단하기 위해 Spring Boot Actuator의 health endpoint를 사용한다.
-
-Actuator 의존성은 Spring Boot 애플리케이션에 추가되어 있다.
-
-```text
-spring-boot-starter-actuator
-```
-
-외부에서 health endpoint를 호출할 수 있도록 Spring Security 설정에서 다음 경로를 인증 없이 접근 가능하게 열어둔다.
-
-```text
-/actuator/health
-```
-
-노출하는 Actuator endpoint는 `health`로 제한한다.
-
-```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health
-  endpoint:
-    health:
-      show-details: never
-```
-
-health check endpoint는 다음 응답을 기준으로 정상 여부를 판단한다.
-
-```text
-GET /actuator/health
--> {"status":"UP"}
-```
-
-GitHub Actions deploy script에서는 새 container 실행 후 최대 30회까지 health check를 재시도한다.
-
-```text
-3초 간격
-최대 30회
-최대 약 90초 대기
-```
-
-health check가 끝까지 성공하지 못하면 배포 job은 실패한다.
-
-## ECR image 배포 방식
+## ECR image 배포 방식 비교
 
 ECR에 image를 push한 뒤에는 실행 환경이 해당 image를 pull해서 container로 실행해야 한다.
-
-대표적인 배포 방식은 다음과 같다.
-
-```text
-GitHub Actions
--> ECR에 image push
--> 실행 환경에서 image pull
--> container 실행
-```
-
-배포 방식별 비교는 다음과 같다.
 
 | 방식 | 배포 흐름 | 장점 | 단점 |
 | --- | --- | --- | --- |
@@ -452,840 +539,34 @@ GitHub Actions
 | EKS | Kubernetes Deployment가 ECR image를 사용하도록 manifest/Helm 배포 | Kubernetes 표준 방식으로 복잡한 workload와 traffic control에 강하다 | 운영 복잡도와 초기 설정 부담이 크다 |
 | Elastic Beanstalk Docker | Elastic Beanstalk 환경에 Docker 애플리케이션 배포 | EC2, load balancer, 배포 흐름을 AWS가 묶어서 관리한다 | 세부 제어가 ECS/EKS보다 제한적이다 |
 
-### EC2에 직접 Docker 실행
+## 현재 완료 상태
 
-EC2 instance에 Docker를 설치하고, GitHub Actions가 SSH로 접속해서 ECR image를 pull한 뒤 container를 재실행하는 방식이다.
-
-```text
-GitHub Actions
--> SSH로 EC2 접속
--> aws ecr get-login-password
--> docker pull
--> docker stop / docker rm
--> docker run
-```
-
-장점:
+현재 완료된 항목은 다음과 같다.
 
 ```text
-구조가 단순하다.
-EC2, Docker, network, log 흐름을 직접 이해하기 좋다.
-작은 개인 프로젝트에서 시작하기 쉽다.
-```
-
-단점:
-
-```text
-서버 운영 책임이 크다.
-무중단 배포, auto scaling, rollback을 직접 구성해야 한다.
-여러 instance로 확장하면 관리가 복잡해진다.
-```
-
-### EC2와 Docker Compose
-
-EC2에 `docker-compose.yml`을 두고, app container와 필요한 주변 container를 함께 실행하는 방식이다.
-
-```text
-GitHub Actions
--> SSH로 EC2 접속
--> docker compose pull
--> docker compose up -d
-```
-
-장점:
-
-```text
-단일 EC2에서 여러 container를 함께 관리하기 쉽다.
-app, nginx, redis 같은 구성을 한 파일로 묶을 수 있다.
-```
-
-단점:
-
-```text
-운영 서버에서 compose 파일과 환경변수 관리가 필요하다.
-여러 서버로 확장하면 별도 전략이 필요하다.
-AWS managed 배포 기능을 직접 누리기는 어렵다.
-```
-
-### ECS
-
-ECS는 AWS의 container orchestration 서비스다. ECR image를 task definition에 지정하고, ECS service가 container 실행과 재시작을 관리한다.
-
-```text
-GitHub Actions
--> ECR push
--> ECS task definition 갱신
--> ECS service deploy
-```
-
-장점:
-
-```text
-AWS 환경에서 ECR, IAM, ALB, CloudWatch와 잘 연결된다.
-container 재시작, 배포, scaling을 AWS가 관리한다.
-Kubernetes보다 진입 장벽이 낮다.
-실무 AWS container 배포에서 자주 쓰이는 선택지다.
-```
-
-단점:
-
-```text
-ECS task definition, service, cluster, ALB 개념을 익혀야 한다.
-초기 설정 항목이 EC2 직접 배포보다 많다.
-AWS에 강하게 묶인다.
-```
-
-### EKS
-
-EKS는 AWS에서 Kubernetes cluster를 관리형으로 제공하는 방식이다. ECR image를 Kubernetes Deployment에서 사용한다.
-
-```text
-GitHub Actions
--> ECR push
--> Kubernetes manifest 또는 Helm chart 갱신
--> kubectl apply / helm upgrade
-```
-
-장점:
-
-```text
-Kubernetes 표준 방식으로 배포할 수 있다.
-대규모 서비스, 복잡한 traffic control, 여러 workload 관리에 강하다.
-cloud provider 이동성이 ECS보다 높다.
-```
-
-단점:
-
-```text
-초기 구성 비용과 운영 복잡도가 높다.
-cluster, node, ingress, service account, secret 관리가 필요하다.
-개인 프로젝트나 작은 서비스에는 과할 수 있다.
-```
-
-### Elastic Beanstalk Docker 배포
-
-Elastic Beanstalk은 AWS가 EC2, load balancer, 배포 관리를 묶어서 제공하는 PaaS 성격의 서비스다. Docker 기반 애플리케이션도 배포할 수 있다.
-
-장점:
-
-```text
-EC2 직접 운영보다 배포 구성이 단순하다.
-AWS가 기본적인 instance, load balancer, 배포 흐름을 관리한다.
-작은 서비스에서 빠르게 배포하기 좋다.
-```
-
-단점:
-
-```text
-세부 제어가 ECS/EKS보다 제한적이다.
-서비스가 커지면 내부 동작을 이해하고 조정해야 하는 지점이 생긴다.
-```
-
-## EC2 Docker 수동 배포 기록
-
-ECR에 push된 Docker image를 EC2에서 직접 pull한 뒤 Docker container로 실행했다.
-
-현재 배포 확인에 사용한 구성은 다음과 같다.
-
-```text
-Region: ap-northeast-2
-Elastic IP: 3.38.56.109
-Application port: 8080
-EC2 IAM Role: ec2-ecr-read-role
-ECR repository: community-ecr
-Image tag: bfc06070ed0b4364ae7b3f879a594ef3f8264c13
-```
-
-EC2에는 다음 두 container를 실행했다.
-
-```text
-dori-mysql
--> mysql:8.4
--> Spring Boot app에서 사용할 MySQL database
-
-dori-community-be
--> ECR에서 pull한 Spring Boot image
--> host 8080 port를 container 8080 port에 연결
-```
-
-전체 구조는 다음과 같다.
-
-```text
-GitHub Actions
--> Docker image build
--> ECR push
-
-EC2
--> ECR image pull
--> dori-mysql container 실행
--> dori-community-be container 실행
--> 3.38.56.109:8080 외부 접근
-```
-
-### EC2 IAM Role
-
-EC2가 ECR image를 pull할 수 있도록 EC2 instance에 IAM Role을 연결했다.
-
-```text
-Role name: ec2-ecr-read-role
-Policy: AmazonEC2ContainerRegistryReadOnly
-```
-
-이 Role의 의미는 다음과 같다.
-
-```text
-EC2 instance에 AWS access key를 직접 저장하지 않는다.
-EC2 instance profile을 통해 ECR read 권한을 얻는다.
-EC2에서 ECR image를 pull할 수 있다.
-```
-
-### Elastic IP
-
-EC2 public IP가 재시작 시 변경되지 않도록 Elastic IP를 연결했다.
-
-```text
-Elastic IP: 3.38.56.109
-```
-
-Elastic IP는 생성만 하고 instance에 연결하지 않으면 비용이 발생할 수 있으므로, 생성 후 EC2 instance에 바로 연결했다.
-
-### Security Group
-
-외부에서 Spring Boot app에 접근할 수 있도록 EC2 Security Group inbound rule에 8080 port를 추가했다.
-
-```text
-SSH 22
--> source: local IP
-
-Custom TCP 8080
--> source: 0.0.0.0/0
-```
-
-초기에는 Spring Boot container를 8080 port로 직접 노출했다.
-
-이후 Nginx reverse proxy와 HTTPS를 적용하면서 외부 8080 inbound rule은 제거하고, Spring Boot container는 localhost에서만 접근 가능하도록 변경했다.
-
-### Docker 설치 확인
-
-EC2에 Docker를 설치하고 실행 상태를 확인했다.
-
-```bash
-docker --version
-docker ps
-```
-
-### ECR login
-
-EC2에서 ECR image를 pull하기 위해 ECR login을 수행한다.
-
-```bash
-aws ecr get-login-password --region ap-northeast-2 \
-| docker login --username AWS --password-stdin 783728775565.dkr.ecr.ap-northeast-2.amazonaws.com
-```
-
-### Docker network
-
-Spring Boot container와 MySQL container가 container 이름으로 통신할 수 있도록 Docker network를 생성했다.
-
-```bash
-docker network create dori-net
-```
-
-같은 Docker network에 있는 container는 container name을 host처럼 사용할 수 있다.
-
-```text
-dori-community-be
--> jdbc:mysql://dori-mysql:3306/pracdb
-```
-
-### MySQL container
-
-RDS를 사용하지 않는 상태라 EC2 내부에서 MySQL container를 함께 실행했다.
-
-```bash
-docker run -d \
-  --name dori-mysql \
-  --network dori-net \
-  -e MYSQL_ROOT_PASSWORD={DB_PASSWORD} \
-  -e MYSQL_DATABASE=pracdb \
-  -v dori-mysql-data:/var/lib/mysql \
-  mysql:8.4
-```
-
-`MYSQL_ROOT_PASSWORD` 값은 Spring Boot container의 `DB_PASSWORD`와 맞춰야 한다.
-
-```text
-MYSQL_ROOT_PASSWORD
--> MySQL root password
-
-DB_USERNAME=root
-DB_PASSWORD={MYSQL_ROOT_PASSWORD와 같은 값}
-```
-
-### Spring Boot 환경변수
-
-Spring Boot container 실행에 필요한 값은 EC2의 `.env` 파일로 주입했다.
-
-```text
-~/dori/.env
-```
-
-필요한 주요 값은 다음과 같다.
-
-```env
-DB_URL=jdbc:mysql://dori-mysql:3306/pracdb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
-DB_USERNAME=root
-DB_PASSWORD={DB_PASSWORD}
-
-JWT_SECRET={JWT_SECRET}
-JWT_TOKEN_EXPIRATION_TIME=3600
-JWT_REFRESH_EXPIRATION_TIME=1209600
-
-AWS_ACCESS_KEY={AWS_ACCESS_KEY}
-AWS_SECRET_KEY={AWS_SECRET_KEY}
-AWS_S3_BUCKET={AWS_S3_BUCKET}
-AWS_REGION=ap-northeast-2
-```
-
-`JWT_SECRET`이 없으면 Spring Boot가 `JwtUtil` bean을 생성하지 못하고 실행에 실패한다.
-
-```text
-Could not resolve placeholder 'JWT_SECRET'
-```
-
-### Spring Boot container
-
-ECR image를 사용해서 Spring Boot container를 실행했다.
-
-```bash
-docker run -d \
-  --name dori-community-be \
-  --network dori-net \
-  --env-file ~/dori/.env \
-  -p 8080:8080 \
-  783728775565.dkr.ecr.ap-northeast-2.amazonaws.com/community-ecr:bfc06070ed0b4364ae7b3f879a594ef3f8264c13
-```
-
-Nginx 적용 이후에는 Spring Boot container를 외부에 직접 노출하지 않고 localhost에만 바인딩한다.
-
-```bash
-docker run -d \
-  --name dori-community-be \
-  --network dori-net \
-  --env-file ~/dori/.env \
-  -p 127.0.0.1:8080:8080 \
-  783728775565.dkr.ecr.ap-northeast-2.amazonaws.com/community-ecr:{IMAGE_TAG}
-```
-
-### Container 상태 확인
-
-실행 중인 container는 다음 명령으로 확인했다.
-
-```bash
-docker ps
-```
-
-확인된 container는 다음과 같다.
-
-```text
-dori-community-be
--> 0.0.0.0:8080->8080/tcp
-
-dori-mysql
--> 3306/tcp
-```
-
-### Memory 부족과 swap
-
-처음 사용한 EC2 instance는 약 1GiB 메모리 환경이었다. Spring Boot와 MySQL container를 함께 실행하자 사용 가능한 메모리가 매우 적었다.
-
-```text
-Mem total: 954Mi
-Mem available: 10Mi
-Swap: 0B
-```
-
-임시로 2GiB swap을 추가해서 container 실행을 안정화했다.
-
-```bash
-sudo fallocate -l 2G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-free -h
-```
-
-swap 추가 후 상태는 다음과 같았다.
-
-```text
-Swap: 2.0Gi
-```
-
-### 배포 확인
-
-EC2 내부에서 `localhost:8080` 응답을 확인했다.
-
-```bash
-curl -I http://localhost:8080
-```
-
-응답은 `401 Unauthorized`였다.
-
-```text
-HTTP/1.1 401
-```
-
-이 응답은 서버가 죽은 것이 아니라, Spring Security가 인증이 필요한 요청에 대해 응답한 것이다.
-
-외부 브라우저에서는 Swagger UI 접속을 확인했다.
-
-```text
-http://3.38.56.109:8080/swagger-ui/index.html
-```
-
-최종 확인된 흐름은 다음과 같다.
-
-```text
-ECR image
--> EC2에서 pull
--> MySQL container 실행
--> Spring Boot container 실행
--> 외부에서 Swagger UI 접속
-```
-
-## Nginx reverse proxy 구성
-
-Spring Boot container를 8080 port로 직접 호출하던 구조에서 Nginx를 앞단에 두는 구조를 추가했다.
-
-기존 구조는 다음과 같다.
-
-```text
-Client
--> EC2:8080
--> Spring Boot container
-```
-
-Nginx 적용 후 구조는 다음과 같다.
-
-```text
-Client
--> EC2:80 or 443
--> Nginx
--> Spring Boot container:8080
-```
-
-프론트엔드는 별도로 S3/CloudFront 정적 배포를 고려하고 있으므로, 현재 Nginx는 React 정적 파일을 서빙하는 용도가 아니라 백엔드 API 앞단 reverse proxy 역할로 사용한다.
-
-### Nginx 설치 확인
-
-EC2에 Nginx를 설치하고 localhost 80 port 응답을 확인했다.
-
-```bash
-curl -I http://localhost
-```
-
-설치 직후에는 Nginx 기본 응답을 확인했다.
-
-```text
-HTTP/1.1 200 OK
-Server: nginx/1.24.0 (Ubuntu)
-```
-
-### Security Group
-
-외부에서 Nginx로 접근할 수 있도록 EC2 Security Group inbound rule에 HTTP 80 port를 추가했다.
-
-```text
-Type: HTTP
-Protocol: TCP
-Port: 80
-Source: 0.0.0.0/0
-```
-
-### Nginx proxy 설정
-
-Nginx site 설정은 Spring Boot container가 열려 있는 localhost 8080으로 요청을 전달하도록 구성했다.
-
-```nginx
-server {
-    listen 80;
-    server_name api.dori-ka.cloud;
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-설정 파일을 활성화한 뒤 Nginx 설정 문법을 확인하고 reload했다.
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-### EC2 내부 확인
-
-Nginx가 80 port에서 외부 요청을 받을 수 있도록 listen 중인지 확인했다.
-
-```bash
-sudo ss -lntp | grep ':80'
-```
-
-확인된 상태는 다음과 같다.
-
-```text
-0.0.0.0:80
--> nginx listen
-
-0.0.0.0:8080
--> docker-proxy listen
-```
-
-Ubuntu 방화벽은 비활성 상태였다.
-
-```bash
-sudo ufw status
-```
-
-```text
-Status: inactive
-```
-
-EC2 내부에서 public IP로 호출했을 때도 Nginx를 통해 Spring Boot 응답이 반환되는 것을 확인했다.
-
-```bash
-curl -I http://3.38.56.109
-```
-
-```text
-HTTP/1.1 401
-Server: nginx/1.24.0 (Ubuntu)
-```
-
-`401` 응답은 Nginx 또는 Spring Boot 장애가 아니라, Spring Security가 인증이 필요한 요청에 대해 응답한 것이다.
-
-### 외부 접근 확인
-
-로컬 Mac에서 Nginx를 통해 Actuator health endpoint에 접근되는 것을 확인했다.
-
-```bash
-curl http://3.38.56.109/actuator/health
-```
-
-```json
-{"status":"UP"}
-```
-
-외부 브라우저에서는 Swagger UI 접근을 확인했다.
-
-```text
-http://3.38.56.109/swagger-ui/index.html
-```
-
-최종 확인된 요청 흐름은 다음과 같다.
-
-```text
-Local browser / curl
--> http://3.38.56.109
--> EC2 Security Group 80
--> Nginx
--> Spring Boot Docker container:8080
-```
-
-도메인과 HTTPS 적용 이후에는 `api.dori-ka.cloud` 기준으로 Nginx server block을 수정했다.
-
-## Domain과 Route 53 연결
-
-백엔드 API를 Elastic IP로 직접 호출하던 구조에서 도메인 기반으로 접근할 수 있도록 `dori-ka.cloud` 도메인을 연결했다.
-
-구성한 도메인은 다음과 같다.
-
-```text
-Root domain: dori-ka.cloud
-Backend API domain: api.dori-ka.cloud
-```
-
-도메인은 가비아에서 구매했고, DNS 관리는 AWS Route 53 Hosted Zone으로 위임했다.
-
-```text
-Domain registrar
--> Gabia
-
-DNS hosting
--> AWS Route 53
-```
-
-### Route 53 Hosted Zone
-
-Route 53에서 `dori-ka.cloud` public hosted zone을 생성했다.
-
-Hosted Zone 생성 후 발급된 NS record는 다음과 같다.
-
-```text
-ns-984.awsdns-59.net
-ns-1698.awsdns-20.co.uk
-ns-1270.awsdns-30.org
-ns-507.awsdns-63.com
-```
-
-가비아 도메인 관리 화면에서 기존 가비아 네임서버를 위 Route 53 네임서버 4개로 변경했다.
-
-```text
-Gabia nameserver
--> Route 53 NS
-```
-
-네임서버 위임 상태는 `dig +trace`로 확인했다.
-
-```bash
-dig +trace dori-ka.cloud NS
-```
-
-정상 위임 후 `.cloud` 상위 네임서버가 Route 53 네임서버를 반환하는 것을 확인했다.
-
-```text
-dori-ka.cloud. IN NS ns-507.awsdns-63.com.
-dori-ka.cloud. IN NS ns-1270.awsdns-30.org.
-dori-ka.cloud. IN NS ns-984.awsdns-59.net.
-dori-ka.cloud. IN NS ns-1698.awsdns-20.co.uk.
-```
-
-### Backend API record
-
-Route 53 Hosted Zone에 백엔드 API용 A record를 생성했다.
-
-```text
-Record name: api.dori-ka.cloud
-Type: A
-Value: 3.38.56.109
-```
-
-DNS 조회 결과 `api.dori-ka.cloud`가 EC2 Elastic IP로 해석되는 것을 확인했다.
-
-```bash
-nslookup api.dori-ka.cloud
-```
-
-```text
-Name: api.dori-ka.cloud
-Address: 3.38.56.109
-```
-
-도메인 기반으로 Actuator health endpoint에 접근되는 것도 확인했다.
-
-```bash
-curl http://api.dori-ka.cloud/actuator/health
-```
-
-```json
-{"status":"UP"}
-```
-
-최종 백엔드 API 접근 흐름은 다음과 같다.
-
-```text
-Client
--> http://api.dori-ka.cloud
--> Route 53
--> EC2 Elastic IP 3.38.56.109
--> Nginx:80
--> Spring Boot Docker container:8080
-```
-
-## Backend HTTPS 적용
-
-프론트엔드를 HTTPS로 배포하면 브라우저에서 HTTP API 호출이 Mixed Content로 차단될 수 있다. 따라서 백엔드 API 도메인인 `api.dori-ka.cloud`에도 HTTPS를 적용했다.
-
-인증서는 Let's Encrypt와 Certbot을 사용해서 발급했다.
-
-```bash
-sudo apt update
-sudo apt install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d api.dori-ka.cloud
-```
-
-처음 인증서 발급은 성공했지만, Certbot이 Nginx server block을 자동으로 찾지 못해 Nginx 설정 적용에는 실패했다.
-
-```text
-Certificate is saved at: /etc/letsencrypt/live/api.dori-ka.cloud/fullchain.pem
-Key is saved at: /etc/letsencrypt/live/api.dori-ka.cloud/privkey.pem
-Could not automatically find a matching server block for api.dori-ka.cloud
-```
-
-원인은 실제로 활성화된 Nginx 설정 파일이 `/etc/nginx/sites-available/default`가 아니라 `/etc/nginx/sites-available/dori-community`였기 때문이다.
-
-활성화된 site 설정은 다음 명령으로 확인했다.
-
-```bash
-sudo ls -l /etc/nginx/sites-enabled/
-```
-
-확인된 symlink는 다음과 같다.
-
-```text
-/etc/nginx/sites-enabled/dori-community
--> /etc/nginx/sites-available/dori-community
-```
-
-따라서 실제 사용 중인 설정 파일의 `server_name`을 `api.dori-ka.cloud`로 수정했다.
-
-```nginx
-server {
-    listen 80;
-    listen [::]:80;
-
-    server_name api.dori-ka.cloud;
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-
-        proxy_http_version 1.1;
-
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-Nginx 설정 반영 후 이미 발급된 인증서를 Nginx에 설치했다.
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-sudo certbot install --cert-name api.dori-ka.cloud
-```
-
-Certbot 적용 후 Nginx 설정에는 443 SSL server block과 80 -> 443 redirect server block이 추가됐다.
-
-```text
-listen 443 ssl;
-ssl_certificate /etc/letsencrypt/live/api.dori-ka.cloud/fullchain.pem;
-ssl_certificate_key /etc/letsencrypt/live/api.dori-ka.cloud/privkey.pem;
-```
-
-Nginx가 443 port를 listen 중인지 확인했다.
-
-```bash
-sudo ss -lntp | grep ':443'
-```
-
-확인 결과 Nginx가 IPv4와 IPv6에서 443 port를 listen 중이었다.
-
-```text
-0.0.0.0:443
--> nginx
-
-[::]:443
--> nginx
-```
-
-EC2 내부에서는 HTTPS reverse proxy가 정상 동작하는 것을 확인했다.
-
-```bash
-curl -k https://localhost/actuator/health
-```
-
-```json
-{"status":"UP"}
-```
-
-외부에서 HTTPS로 접근할 수 있도록 EC2 Security Group에 443 inbound rule을 추가했다.
-
-```text
-Type: HTTPS
-Protocol: TCP
-Port: 443
-Source: 0.0.0.0/0
-```
-
-로컬 Mac에서도 백엔드 HTTPS health check가 성공하는 것을 확인했다.
-
-```bash
-curl https://api.dori-ka.cloud/actuator/health
-```
-
-```json
-{"status":"UP"}
-```
-
-현재 백엔드 API 요청 흐름은 다음과 같다.
-
-```text
-Client
--> https://api.dori-ka.cloud
--> Route 53
--> EC2 Elastic IP 3.38.56.109
--> Security Group 443
--> Nginx HTTPS
--> 127.0.0.1:8080
--> Spring Boot Docker container
-```
-
-## Frontend S3 정적 배포와 Backend API 연동
-
-프론트엔드는 Vite React 프로젝트를 build한 뒤 S3 정적 웹사이트 호스팅으로 배포했다.
-
-프론트엔드 프로젝트 경로는 다음과 같다.
-
-```text
-/Users/kahansol/Desktop/kakao/dori-week8-js/community-react
-```
-
-배포 대상은 Vite build 결과물인 `dist/`이다.
-
-```bash
-npm run build
-aws s3 sync dist/ s3://dori-community-fe --delete
-```
-
-S3 정적 웹사이트 설정은 다음과 같이 구성했다.
-
-```text
-Index document: index.html
-Error document: index.html
-```
-
-`Error document`도 `index.html`로 설정해서 React Router 기반 SPA 경로에서 새로고침하더라도 `index.html`을 반환하도록 했다.
-
-프론트엔드 S3 정적 웹사이트 endpoint는 다음과 같다.
-
-```text
-http://dori-community-fe.s3-website.ap-northeast-2.amazonaws.com
-```
-
-### Frontend API base URL
-
-프론트엔드에서 백엔드 API 주소를 코드에 직접 고정하지 않고 Vite 환경변수로 분리했다.
-
-```javascript
-baseURL: import.meta.env.VITE_API_BASE_URL
-```
-
-production build에서는 `.env.production`에 백엔드 API 도메인을 설정했다.
-
-```env
-VITE_API_BASE_URL=http://api.dori-ka.cloud
-```
-
-Vite의 `VITE_` 환경변수는 build 시점에 브라우저 JavaScript bundle에 포함된다. 따라서 API base URL처럼 공개되어도 되는 설정값만 저장한다.
-
-프론트엔드에서 확인한 연동 흐름은 다음과 같다.
-
-```text
-S3 static website
--> React application
--> http://api.dori-ka.cloud
--> Route 53
--> EC2 Nginx
--> Spring Boot
-```
-
-프론트엔드 화면에서 백엔드 API 호출과 이미지 조회가 정상 동작하는 것을 확인했다.
+Backend
+-> Dockerfile 작성
+-> ECR repository 생성
+-> GitHub Actions OIDC Role 구성
+-> ECR image push 자동화
+-> EC2 Docker 배포
+-> Nginx reverse proxy 구성
+-> api.dori-ka.cloud DNS 연결
+-> Let's Encrypt HTTPS 적용
+-> Actuator health check 기반 배포 검증
+
+Frontend
+-> Vite production build
+-> S3 정적 파일 배포
+-> CloudFront CDN 구성
+-> dori-ka.cloud, www.dori-ka.cloud DNS 연결
+-> ACM 인증서 기반 HTTPS 적용
+-> React Router SPA fallback 설정
+-> GitHub Actions S3 sync, CloudFront invalidation 구성
+
+Integration
+-> Frontend API base URL을 https://api.dori-ka.cloud로 분리
+-> Backend CORS에 CloudFront frontend domain 허용
+```
+
+현재 구성은 개인 프로젝트 기준으로 백엔드와 프론트엔드의 1차 배포 자동화가 완료된 상태다.
