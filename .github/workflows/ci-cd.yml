@@ -106,3 +106,36 @@ jobs:
             echo "Health check failed"
             docker logs dori-community-be
             exit 1
+
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    needs: build
+    if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      - name: Send deployment result
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEPLOY_RESULT: ${{ needs.build.result }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not configured; skipping notification."
+            exit 0
+          fi
+
+          if [ "$DEPLOY_RESULT" = "success" ]; then
+            STATUS="succeeded"
+          else
+            STATUS="failed"
+          fi
+
+          MESSAGE="[Dori Community] Backend deployment $STATUS\nRepository: $REPOSITORY\nBranch: $BRANCH\nCommit: ${COMMIT_SHA:0:7}\nActions: $RUN_URL"
+          curl --fail --show-error --silent \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg content "$MESSAGE" '{content: $content}')" \
+            "$DISCORD_WEBHOOK_URL"
