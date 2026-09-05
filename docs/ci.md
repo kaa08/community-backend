@@ -1,12 +1,12 @@
 # CI
 
-이 문서는 현재 프로젝트에 구성한 CI 내용을 정리한다.
+이 문서는 Dori Community 프로젝트에 구성한 CI 내용을 정리한다.
 
 ## CI 정의
 
-CI는 Continuous Integration의 줄임말이다. 이 프로젝트에서는 GitHub Actions를 사용해서 PR 또는 주요 브랜치 push 시 코드를 자동 검증하도록 구성했다.
+CI는 Continuous Integration의 줄임말이다. 이 프로젝트에서는 GitHub Actions를 사용해서 PR 또는 주요 브랜치 push 시 백엔드와 프론트엔드 코드를 자동 검증하도록 구성했다.
 
-현재 CI의 의미는 다음과 같다.
+현재 백엔드 CI의 의미는 다음과 같다.
 
 ```text
 새로운 코드가 깨끗한 GitHub 실행 환경에서도 컴파일되는지 확인한다.
@@ -23,12 +23,34 @@ CI 성공 = Docker image build 성공
 CI 성공 != 서버 배포 완료
 ```
 
+프론트엔드 CI의 의미는 다음과 같다.
+
+```text
+새로운 코드가 깨끗한 GitHub 실행 환경에서 의존성을 설치할 수 있는지 확인한다.
+ESLint 검사를 통과하는지 확인한다.
+Vite production build가 정상적으로 생성되는지 확인한다.
+```
+
 ## Workflow 파일
 
-CI workflow 파일은 다음 위치에 있다.
+백엔드 CI workflow 파일은 다음 위치에 있다.
 
 ```text
 .github/workflows/ci-cd.yml
+```
+
+프론트엔드 CI workflow 파일도 프론트엔드 repository의 같은 위치에 둔다.
+
+```text
+.github/workflows/ci-cd.yml
+```
+
+프론트엔드 repository에서는 실제 Vite React 프로젝트가 `community-react` 하위에 있으므로 workflow의 working directory를 `community-react`로 지정한다.
+
+```yaml
+defaults:
+  run:
+    working-directory: community-react
 ```
 
 현재 CI는 `main`, `master`, `dev` 브랜치 push와 pull request에서 실행되도록 설정했다.
@@ -43,9 +65,9 @@ on:
   pull_request:
 ```
 
-## 현재 CI 실행 단계
+## Backend CI 실행 단계
 
-현재 CI가 하는 일은 다음과 같다.
+백엔드 CI가 하는 일은 다음과 같다.
 
 ```text
 GitHub Actions runner 실행
@@ -176,3 +198,42 @@ docker build -t dori-community-be:${{ github.sha }} .
 ```
 
 이 단계는 image를 registry에 push하지 않고, Dockerfile로 image가 정상 생성되는지만 확인한다.
+
+## Frontend CI 실행 단계
+
+프론트엔드 CI가 하는 일은 다음과 같다.
+
+```text
+GitHub Actions runner 실행
+-> repository checkout
+-> Node.js 22 설치
+-> npm ci
+-> npm run lint
+-> npm run build
+-> dist artifact 업로드
+```
+
+각 단계의 의미는 다음과 같다.
+
+```text
+npm ci
+-> package-lock.json 기준으로 의존성 설치
+
+npm run lint
+-> ESLint 기반 정적 검사
+
+npm run build
+-> Vite production build 생성
+
+artifact upload
+-> CD job에서 사용할 dist 결과물 보관
+```
+
+프론트엔드 CI에서 통과해야 하는 핵심 기준은 `lint`와 `build`이다. 특히 GitHub Actions runner는 Linux 환경이므로 파일명 대소문자를 구분한다. macOS에서는 통과하던 import 경로도 실제 파일명과 대소문자가 다르면 GitHub Actions build에서 실패할 수 있다.
+
+```text
+FileDropZone.jsx
+FileDropZone.css
+```
+
+import 경로도 실제 파일명과 동일하게 맞춰야 한다.
