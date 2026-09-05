@@ -129,13 +129,20 @@ jobs:
           fi
 
           if [ "$DEPLOY_RESULT" = "success" ]; then
-            STATUS="succeeded"
+            TITLE="Backend deployment succeeded"
+            COLOR=5763719
           else
-            STATUS="failed"
+            TITLE="Backend deployment failed"
+            COLOR=15548997
           fi
 
-          MESSAGE="[Dori Community] Backend deployment $STATUS\nRepository: $REPOSITORY\nBranch: $BRANCH\nCommit: ${COMMIT_SHA:0:7}\nActions: $RUN_URL"
+          DESCRIPTION=$(printf 'Repository: `%s`\nBranch: `%s`\nCommit: `%s`' "$REPOSITORY" "$BRANCH" "${COMMIT_SHA:0:7}")
           curl --fail --show-error --silent \
             -H "Content-Type: application/json" \
-            --data "$(jq -n --arg content "$MESSAGE" '{content: $content}')" \
+            --data "$(jq -n \
+              --arg title "$TITLE" \
+              --arg description "$DESCRIPTION" \
+              --arg url "$RUN_URL" \
+              --argjson color "$COLOR" \
+              '{embeds: [{title: $title, description: $description, color: $color, url: $url, footer: {text: "GitHub Actions"}}], allowed_mentions: {parse: []}}')" \
             "$DISCORD_WEBHOOK_URL"
