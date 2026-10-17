@@ -79,6 +79,7 @@ GitHub Actions
 -> 기존 Spring Boot container 제거
 -> 새 Spring Boot container 실행
 -> Actuator health check
+-> 실패하면 이전 image로 복구 후 배포 실패 처리
 ```
 
 ### Amazon ECR
@@ -214,10 +215,98 @@ GitHub Actions deploy step에서는 새 container 실행 후 health check를 최
 ```text
 3초 간격
 최대 30회
-최대 약 90초 대기
+각 요청의 연결 제한 2초, 전체 요청 제한 5초
+요청 시간을 포함하면 한 차례의 검증에 최대 약 4분 소요
 ```
 
-health check가 성공하면 배포 성공으로 처리하고, 실패하면 container log를 출력한 뒤 job을 실패 처리한다.
+health check가 성공하면 배포 성공으로 처리한다. 새 container 실행이나 health check가 실패하면 container log를 출력하고 이전 image로 복구를 시도한다. 복구에 성공해도 새 버전 배포는 실패 처리한다.
+
+### Backend 자동 롤백
+
+GitHub Actions의 `Deploy to EC2` 단계에서 다음 순서로 실행한다.
+
+1. EC2의 `~/dori/deploy.lock`에 `flock` 잠금을 획득한다. 다른 배포가 같은 잠금을 사용 중이면 container를 변경하기 전에 실패 처리한다.
+2. 환경변수 파일과 Docker network를 확인한다. 기존 container가 있으면 변경되지 않는 image ID(`sha256:...`)를 저장하고 현재 health check가 성공하는지 확인한다. 기존 서비스가 비정상이면 자동 배포를 중단하고 수동 복구 대상으로 안내한다.
+3. ECR 로그인과 새 image 다운로드를 완료한다. 이 단계가 실패하면 기존 container는 유지한다.
+4. 기존 container를 제거하고 새 image로 실행한다. health check가 성공하면 배포를 완료한다.
+5. 새 container 실행 또는 health check가 실패하면 로그를 출력하고 실패한 container를 제거한다.
+6. 저장한 이전 image ID로 container를 다시 실행하고 동일한 health check를 수행한다.
+7. 복구 성공 여부를 로그에 남기고 job은 실패로 종료한다. 기존 Discord 알림도 배포 실패를 알리며, 복구 결과는 Actions 로그에서 확인한다.
+
+최초 배포처럼 이전 image가 없으면 자동 롤백을 수행할 수 없다. 이전 image의 재실행이나 health check도 실패하면 수동 복구가 필요하다. Workflow의 강제 취소나 EC2 자체 장애는 이 실패 처리만으로 복구를 보장하지 않는다.
+
+자동 롤백은 기존 network, `.env`, port binding으로 애플리케이션 image를 되돌리는 방식이다. DB나 환경변수 파일은 복원하지 않으므로 DB 변경 시 이전 버전과 호환되는지 확인해야 한다. container 교체 중에는 서비스가 잠시 중단되며 무중단 배포는 아니다.
+
+복구할 image를 남겨두기 위해 배포 직후의 `docker image prune -f`는 제거했다. image가 누적될 수 있으므로 디스크 사용량과 별도의 image 보관 정책을 관리한다. 원격 명령 제한은 새 버전과 복구 버전의 health check 시간을 고려해 15분으로 설정한다.
+
+Workflow에 포함된 배포 Bash 스크립트는 다음 명령으로 테스트한다. Ruby 표준 라이브러리만 사용하며, Docker, AWS, HTTP 요청, 대기는 가짜 명령으로 대체한다. 실제 서버에는 접속하지 않는다. CI에서도 동일한 테스트를 실행한다.
+
+```bash
+ruby tests/deploy_rollback_test.rb
+```
+
+### Backend 수동 롤백
+
+자동 롤백이 실패하거나 운영자가 특정 버전으로 복구해야 할 때는 아래 절차로 마지막으로 정상 동작했던 image를 다시 실행한다. 진행 전에 GitHub Actions에서 실행 중인 배포가 없는지 확인한다.
+
+> 이 절차는 애플리케이션 container만 교체하며, 교체 중에는 서비스가 잠시 중단된다. MySQL container와 데이터는 삭제하지 않는다. 진행 중에는 새 배포가 동시에 실행되지 않도록 주의한다. DB 스키마나 데이터가 변경된 경우 이전 애플리케이션 버전과 호환되는지 먼저 확인한다. 이미지 롤백은 DB 변경을 되돌리지 않는다.
+
+1. GitHub Actions의 백엔드 `CI/CD` 실행 목록에서 장애가 발생하기 **전**, 실제 서비스가 정상 동작했던 `main` 또는 `master` 배포를 찾는다. 해당 실행의 commit **전체 SHA**를 복사한다. 가장 최근 image가 반드시 정상 image인 것은 아니다.
+2. EC2에 SSH로 접속하고 아래 값을 설정한다. `IMAGE_TAG`에는 1번에서 복사한 전체 SHA를 넣는다.
+
+```bash
+AWS_REGION=ap-northeast-2
+ECR_REGISTRY=783728775565.dkr.ecr.ap-northeast-2.amazonaws.com
+ECR_REPOSITORY=community-ecr
+IMAGE_TAG=여기에_정상_배포된_전체_커밋_SHA
+```
+
+3. ECR에 로그인한 뒤 image를 미리 pull한다. **로그인과 pull이 성공한 것을 확인하기 전에는 기존 container를 제거하지 않는다.** 해당 태그가 ECR에서 삭제되었거나 권한이 없으면 멈추고 원인을 확인한다.
+
+```bash
+aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+```
+
+```bash
+docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+```
+
+4. 현재 애플리케이션 container를 교체한다. 이 명령은 `dori-community-be`만 제거하며 `dori-mysql`은 건드리지 않는다.
+
+```bash
+docker rm -f dori-community-be
+```
+
+```bash
+docker run -d \
+  --name dori-community-be \
+  --network dori-net \
+  --env-file ~/dori/.env \
+  -p 127.0.0.1:8080:8080 \
+  "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+```
+
+5. 애플리케이션이 시작된 후 EC2 내부와 외부에서 각각 health check를 확인한다.
+
+```bash
+# EC2에서 실행
+curl --fail --show-error http://localhost:8080/actuator/health
+```
+
+```bash
+# 로컬 PC 등 외부에서 실행
+curl --fail --show-error https://api.dori-ka.cloud/actuator/health
+```
+
+두 요청 모두 `{"status":"UP"}`을 반환하면 확인된 경로의 health check는 정상이다. 이어서 로그인과 게시글 조회 등 주요 기능도 점검한다. 시작 중에는 응답까지 시간이 걸릴 수 있다. 계속 실패하면 다음 명령으로 로그를 확인한다.
+
+```bash
+docker logs --tail 100 dori-community-be
+```
+
+롤백한 커밋 SHA와 사유를 기록한다. 이 작업은 운영 중인 container만 변경하며 Git의 `master` 코드나 GitHub Actions 배포 이력은 되돌리지 않는다. 이후 `master`에 다시 push하면 그 커밋이 다시 배포될 수 있다.
+
+2026-10-17 수동 검증에서는 `5049fdc029ecdd4d9eaa8f064ca5ee6cc9687829`에서 `702c51f44a983da7ed116f1b629f541ad01b668d`로 교체한 후 EC2 내부와 외부 HTTPS health check의 `UP`을 확인했다. 이후 `5049fdc029ecdd4d9eaa8f064ca5ee6cc9687829`로 복귀하고 두 경로의 `UP`을 다시 확인했다. 이 기록은 수동 롤백 검증이며, 자동 롤백의 실제 EC2 동작 검증은 별도로 필요하다.
 
 ## Backend GitHub Actions
 
