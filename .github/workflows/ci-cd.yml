@@ -25,6 +25,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Test deployment rollback script
+        run: ruby tests/deploy_rollback_test.rb
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -81,31 +84,102 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,AWS_REGION
+          command_timeout: 15m
           script: |
-            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-            docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-            docker rm -f dori-community-be || true
-            docker run -d \
-              --name dori-community-be \
-              --network dori-net \
-              --env-file ~/dori/.env \
-              -p 127.0.0.1:8080:8080 \
-              "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            bash -se <<'DEPLOY_SCRIPT'
+            set -euo pipefail
 
-            for i in $(seq 1 30); do
-              if curl -fsS http://localhost:8080/actuator/health; then
-                echo "Health check succeeded"
-                docker image prune -f
-                exit 0
-              fi
+            CONTAINER=dori-community-be
+            NEW_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            PREVIOUS_IMAGE=""
 
-              echo "Waiting for application health check... ($i/30)"
-              sleep 3
+            for command in aws docker curl flock; do
+              command -v "$command" > /dev/null
             done
 
-            echo "Health check failed"
-            docker logs dori-community-be
+            # Keep the lock until deployment or recovery has finished.
+            exec 9> "$HOME/dori/deploy.lock"
+            if ! flock -n 9; then
+              echo "Another backend deployment is in progress."
+              exit 1
+            fi
+
+            test -r "$HOME/dori/.env"
+            docker network inspect dori-net > /dev/null
+
+            CURRENT_CONTAINER=$(docker ps -aq --filter "name=^/${CONTAINER}$")
+            if [ -n "$CURRENT_CONTAINER" ]; then
+              PREVIOUS_IMAGE=$(docker inspect --format '{{.Image}}' "$CONTAINER")
+              docker image inspect "$PREVIOUS_IMAGE" > /dev/null
+              echo "Previous image ID: $PREVIOUS_IMAGE"
+              if ! curl -fsS --connect-timeout 2 --max-time 5 \
+                http://localhost:8080/actuator/health > /dev/null; then
+                echo "Existing backend is unhealthy; choose a recovery image manually."
+                exit 1
+              fi
+            fi
+
+            # Finish authentication and download before stopping the service.
+            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+            docker pull "$NEW_IMAGE"
+
+            start_container() {
+              docker run -d \
+                --name "$CONTAINER" \
+                --network dori-net \
+                --env-file "$HOME/dori/.env" \
+                -p 127.0.0.1:8080:8080 \
+                "$1"
+            }
+
+            wait_for_health() {
+              for i in $(seq 1 30); do
+                if curl -fsS --connect-timeout 2 --max-time 5 \
+                  http://localhost:8080/actuator/health; then
+                  echo "Health check succeeded"
+                  return 0
+                fi
+                echo "Waiting for application health check... ($i/30)"
+                if [ "$i" -lt 30 ]; then
+                  sleep 3
+                fi
+              done
+              return 1
+            }
+
+            if [ -n "$PREVIOUS_IMAGE" ]; then
+              docker rm -f "$CONTAINER"
+            fi
+
+            if start_container "$NEW_IMAGE" && wait_for_health; then
+              echo "Deployment succeeded: $NEW_IMAGE"
+              exit 0
+            fi
+
+            echo "Deployment failed: $NEW_IMAGE"
+            docker logs --tail 100 "$CONTAINER" || true
+
+            # A failed docker run can still leave a container with this name.
+            CURRENT_CONTAINER=$(docker ps -aq --filter "name=^/${CONTAINER}$")
+            if [ -n "$CURRENT_CONTAINER" ]; then
+              docker rm -f "$CONTAINER"
+            fi
+
+            if [ -z "$PREVIOUS_IMAGE" ]; then
+              echo "No previous image is available; manual recovery is required."
+              exit 1
+            fi
+
+            echo "Rolling back to image ID: $PREVIOUS_IMAGE"
+            if start_container "$PREVIOUS_IMAGE" && wait_for_health; then
+              echo "Rollback succeeded. The new deployment is still marked as failed."
+            else
+              echo "Rollback failed; manual recovery is required."
+              docker logs --tail 100 "$CONTAINER" || true
+            fi
+
             exit 1
+            DEPLOY_SCRIPT
 
   notify:
     name: Notify Discord
